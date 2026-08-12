@@ -203,6 +203,31 @@ def coletar_ids_responsaveis(tasks_json) -> list:
     return sorted(ids)
 
 
+def montar_df_tasks_responsaveis(tasks_json, ids_validos: set) -> pd.DataFrame:
+    """Tabela-ponte id_task/id_user. So inclui ids presentes em planner_users
+    (ids_validos) pra nao violar a FK caso a resolucao de usuarios tenha falhado."""
+    registros = [
+        {"id_task": t["id"], "id_user": id_user}
+        for t in tasks_json
+        for id_user in (t.get("assignments") or {}).keys()
+        if id_user in ids_validos
+    ]
+
+    return pd.DataFrame(registros, columns=["id_task", "id_user"])
+
+
+def montar_df_tasks_categorias(tasks_json, category_descriptions: dict) -> pd.DataFrame:
+    """Tabela-ponte id_task/categoria (ja com o rotulo resolvido)."""
+    registros = [
+        {"id_task": t["id"], "categoria": category_descriptions.get(slot, slot)}
+        for t in tasks_json
+        for slot, aplicada in (t.get("appliedCategories") or {}).items()
+        if aplicada
+    ]
+
+    return pd.DataFrame(registros, columns=["id_task", "categoria"])
+
+
 # ==========================================
 # CARGA (TRUNCATE + INSERT nas 4 tabelas, numa unica transacao)
 # ==========================================
@@ -253,6 +278,20 @@ def garantir_tabelas(engine):
 
     CREATE INDEX IF NOT EXISTS ix_planner_tasks_id_plan   ON "{SCHEMA_DESTINO}".planner_tasks(id_plan);
     CREATE INDEX IF NOT EXISTS ix_planner_tasks_id_bucket ON "{SCHEMA_DESTINO}".planner_tasks(id_bucket);
+
+    CREATE TABLE IF NOT EXISTS "{SCHEMA_DESTINO}".planner_tasks_responsaveis (
+        id_task  VARCHAR(64) REFERENCES "{SCHEMA_DESTINO}".planner_tasks(id_task) ON DELETE CASCADE,
+        id_user  VARCHAR(64) REFERENCES "{SCHEMA_DESTINO}".planner_users(id_user) ON DELETE CASCADE,
+        PRIMARY KEY (id_task, id_user)
+    );
+
+    CREATE TABLE IF NOT EXISTS "{SCHEMA_DESTINO}".planner_tasks_categorias (
+        id_task    VARCHAR(64) REFERENCES "{SCHEMA_DESTINO}".planner_tasks(id_task) ON DELETE CASCADE,
+        categoria  VARCHAR(255),
+        PRIMARY KEY (id_task, categoria)
+    );
+
+    CREATE INDEX IF NOT EXISTS ix_planner_tasks_responsaveis_id_user ON "{SCHEMA_DESTINO}".planner_tasks_responsaveis(id_user);
     """
 
     with engine.begin() as conn:
@@ -261,15 +300,18 @@ def garantir_tabelas(engine):
     log_success("Tabelas garantidas com sucesso.")
 
 
-def carregar_postgres(engine, df_plan, df_buckets, df_users, df_tasks):
+def carregar_postgres(engine, df_plan, df_buckets, df_users, df_tasks, df_responsaveis, df_categorias):
     log_info(
-        f"Carregando 1 plano, {len(df_buckets)} buckets, {len(df_users)} usuarios "
-        f"e {len(df_tasks)} tarefas (TRUNCATE + INSERT numa unica transacao)."
+        f"Carregando 1 plano, {len(df_buckets)} buckets, {len(df_users)} usuarios, "
+        f"{len(df_tasks)} tarefas, {len(df_responsaveis)} vinculos de responsavel e "
+        f"{len(df_categorias)} vinculos de categoria (TRUNCATE + INSERT numa unica transacao)."
     )
 
     with engine.begin() as conn:
         conn.execute(text(
-            f'TRUNCATE TABLE "{SCHEMA_DESTINO}".planner_tasks, '
+            f'TRUNCATE TABLE "{SCHEMA_DESTINO}".planner_tasks_responsaveis, '
+            f'"{SCHEMA_DESTINO}".planner_tasks_categorias, '
+            f'"{SCHEMA_DESTINO}".planner_tasks, '
             f'"{SCHEMA_DESTINO}".planner_buckets, '
             f'"{SCHEMA_DESTINO}".planner_users, '
             f'"{SCHEMA_DESTINO}".planner_plans RESTART IDENTITY CASCADE;'
@@ -307,6 +349,26 @@ def carregar_postgres(engine, df_plan, df_buckets, df_users, df_tasks):
         if not df_tasks.empty:
             df_tasks.to_sql(
                 name="planner_tasks",
+                schema=SCHEMA_DESTINO,
+                con=conn,
+                if_exists="append",
+                index=False,
+                method=psql_insert_copy,
+            )
+
+        if not df_responsaveis.empty:
+            df_responsaveis.to_sql(
+                name="planner_tasks_responsaveis",
+                schema=SCHEMA_DESTINO,
+                con=conn,
+                if_exists="append",
+                index=False,
+                method=psql_insert_copy,
+            )
+
+        if not df_categorias.empty:
+            df_categorias.to_sql(
+                name="planner_tasks_categorias",
                 schema=SCHEMA_DESTINO,
                 con=conn,
                 if_exists="append",
@@ -358,8 +420,15 @@ def executar():
             f"Falha ao resolver responsaveis (seguindo sem essa parte): {e}"
         )
 
+    ids_resolvidos = set(df_users["id_user"]) if not df_users.empty else set()
+    df_tasks_responsaveis = montar_df_tasks_responsaveis(tasks_json, ids_resolvidos)
+    df_tasks_categorias = montar_df_tasks_categorias(tasks_json, category_descriptions)
+
     garantir_tabelas(engine)
-    carregar_postgres(engine, df_plan, df_buckets, df_users, df_tasks)
+    carregar_postgres(
+        engine, df_plan, df_buckets, df_users, df_tasks,
+        df_tasks_responsaveis, df_tasks_categorias,
+    )
 
     log_success("Job finalizado: planner_datalake.py.")
 
