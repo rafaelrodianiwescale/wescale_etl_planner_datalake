@@ -26,11 +26,17 @@ def get_env_var(name: str, required: bool = True, default: str | None = None) ->
 
 
 def get_graph_config() -> dict:
+    plan_ids = [
+        plan_id.strip()
+        for plan_id in get_env_var("PLANNER_PLAN_IDS").split(",")
+        if plan_id.strip()
+    ]
+
     return {
         "tenant_id": get_env_var("AZURE_TENANT_ID"),
         "client_id": get_env_var("AZURE_CLIENT_ID"),
         "client_secret": get_env_var("AZURE_CLIENT_SECRET"),
-        "plan_id": get_env_var("PLANNER_PLAN_ID"),
+        "plan_ids": plan_ids,
     }
 
 

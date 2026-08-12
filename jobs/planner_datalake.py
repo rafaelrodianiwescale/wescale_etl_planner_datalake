@@ -1,5 +1,4 @@
 import sys
-import json
 from pathlib import Path
 
 import pandas as pd
@@ -111,8 +110,17 @@ def fetch_users(user_ids, headers) -> list:
     return usuarios
 
 
+def coletar_ids_responsaveis(tasks_json) -> list:
+    ids = set()
+
+    for t in tasks_json:
+        ids.update((t.get("assignments") or {}).keys())
+
+    return sorted(ids)
+
+
 # ==========================================
-# TRANSFORMAÇÃO
+# TRANSFORMAÇÃO (tudo consolidado numa linha por tarefa)
 # ==========================================
 
 def converter_datetime(valor):
@@ -127,57 +135,27 @@ def converter_datetime(valor):
     return ts.to_pydatetime().replace(tzinfo=None)
 
 
-def montar_df_plan(plan_json) -> pd.DataFrame:
-    return pd.DataFrame([{
-        "id_plan": plan_json["id"],
-        "titulo": plan_json.get("title"),
-        "dt_criacao": converter_datetime(plan_json.get("createdDateTime")),
-    }])
+def montar_df_planner(plan_json, buckets_json, tasks_json, category_descriptions: dict, nomes_por_id: dict) -> pd.DataFrame:
+    buckets_dict = {b["id"]: b.get("name") for b in buckets_json}
 
-
-def montar_df_buckets(buckets_json) -> pd.DataFrame:
-    registros = [
-        {
-            "id_bucket": b["id"],
-            "id_plan": b.get("planId"),
-            "nome": b.get("name"),
-        }
-        for b in buckets_json
-    ]
-
-    return pd.DataFrame(registros)
-
-
-def montar_df_users(users_json) -> pd.DataFrame:
-    registros = [
-        {
-            "id_user": u["id"],
-            "nome": u.get("displayName"),
-            "email": u.get("mail"),
-        }
-        for u in users_json
-    ]
-
-    return pd.DataFrame(registros)
-
-
-def montar_df_tasks(tasks_json, category_descriptions: dict) -> pd.DataFrame:
     registros = []
 
     for t in tasks_json:
-        responsaveis = list((t.get("assignments") or {}).keys())
+        ids_responsaveis = (t.get("assignments") or {}).keys()
+        nomes_responsaveis = sorted(nomes_por_id.get(id_user, id_user) for id_user in ids_responsaveis)
 
         slots_categoria = [k for k, v in (t.get("appliedCategories") or {}).items() if v]
-        rotulos_categoria = [
-            category_descriptions.get(slot, slot)
-            for slot in slots_categoria
-        ]
+        rotulos_categoria = sorted(category_descriptions.get(slot, slot) for slot in slots_categoria)
+
+        id_bucket = t.get("bucketId")
 
         registros.append({
             "id_task": t["id"],
-            "titulo": t.get("title"),
-            "id_plan": t.get("planId"),
-            "id_bucket": t.get("bucketId"),
+            "id_plan": plan_json["id"],
+            "plano": plan_json.get("title"),
+            "id_bucket": id_bucket,
+            "bucket": buckets_dict.get(id_bucket),
+            "tarefa": t.get("title"),
             "percentual_concluido": t.get("percentComplete"),
             "prioridade": t.get("priority"),
             "dt_inicio": converter_datetime(t.get("startDateTime")),
@@ -187,188 +165,61 @@ def montar_df_tasks(tasks_json, category_descriptions: dict) -> pd.DataFrame:
             "fl_tem_descricao": bool(t.get("hasDescription")),
             "qtd_checklist_ativos": t.get("activeCheckitemCount"),
             "qtd_checklist_total": t.get("totalCheckitemCount"),
-            "responsaveis": json.dumps(responsaveis),
-            "categorias": json.dumps(rotulos_categoria),
+            "responsaveis": ", ".join(nomes_responsaveis),
+            "categorias": ", ".join(rotulos_categoria),
         })
 
     return pd.DataFrame(registros)
 
 
-def coletar_ids_responsaveis(tasks_json) -> list:
-    ids = set()
-
-    for t in tasks_json:
-        ids.update((t.get("assignments") or {}).keys())
-
-    return sorted(ids)
-
-
-def montar_df_tasks_responsaveis(tasks_json, ids_validos: set) -> pd.DataFrame:
-    """Tabela-ponte id_task/id_user. So inclui ids presentes em planner_users
-    (ids_validos) pra nao violar a FK caso a resolucao de usuarios tenha falhado."""
-    registros = [
-        {"id_task": t["id"], "id_user": id_user}
-        for t in tasks_json
-        for id_user in (t.get("assignments") or {}).keys()
-        if id_user in ids_validos
-    ]
-
-    return pd.DataFrame(registros, columns=["id_task", "id_user"])
-
-
-def montar_df_tasks_categorias(tasks_json, category_descriptions: dict) -> pd.DataFrame:
-    """Tabela-ponte id_task/categoria (ja com o rotulo resolvido)."""
-    registros = [
-        {"id_task": t["id"], "categoria": category_descriptions.get(slot, slot)}
-        for t in tasks_json
-        for slot, aplicada in (t.get("appliedCategories") or {}).items()
-        if aplicada
-    ]
-
-    return pd.DataFrame(registros, columns=["id_task", "categoria"])
-
-
 # ==========================================
-# CARGA (TRUNCATE + INSERT nas 4 tabelas, numa unica transacao)
+# CARGA (TRUNCATE + INSERT numa unica tabela)
 # ==========================================
 
-def garantir_tabelas(engine):
-    log_info("Garantindo tabelas planner_plans, planner_buckets, planner_tasks e planner_users.")
+def garantir_tabela(engine):
+    log_info("Garantindo tabela microsoft_planners.")
 
     sql = f"""
-    CREATE TABLE IF NOT EXISTS "{SCHEMA_DESTINO}".planner_plans (
-        id_plan             VARCHAR(64) PRIMARY KEY,
-        titulo              VARCHAR(255),
-        dt_criacao          TIMESTAMP,
-        dt_atualizacao_etl  TIMESTAMP NOT NULL DEFAULT NOW()
+    CREATE TABLE IF NOT EXISTS "{SCHEMA_DESTINO}".microsoft_planners (
+        id_task               VARCHAR(64) PRIMARY KEY,
+        id_plan               VARCHAR(64),
+        plano                 VARCHAR(255),
+        id_bucket             VARCHAR(64),
+        bucket                VARCHAR(255),
+        tarefa                VARCHAR(500),
+        percentual_concluido  INT,
+        prioridade             INT,
+        dt_inicio              TIMESTAMP,
+        dt_vencimento          TIMESTAMP,
+        dt_conclusao           TIMESTAMP,
+        dt_criacao             TIMESTAMP,
+        fl_tem_descricao       BOOLEAN,
+        qtd_checklist_ativos   INT,
+        qtd_checklist_total    INT,
+        responsaveis           TEXT,
+        categorias             TEXT,
+        dt_atualizacao_etl     TIMESTAMP NOT NULL DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS "{SCHEMA_DESTINO}".planner_buckets (
-        id_bucket           VARCHAR(64) PRIMARY KEY,
-        id_plan             VARCHAR(64) REFERENCES "{SCHEMA_DESTINO}".planner_plans(id_plan) ON DELETE CASCADE,
-        nome                VARCHAR(255),
-        dt_atualizacao_etl  TIMESTAMP NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS "{SCHEMA_DESTINO}".planner_users (
-        id_user             VARCHAR(64) PRIMARY KEY,
-        nome                VARCHAR(255),
-        email               VARCHAR(255),
-        dt_atualizacao_etl  TIMESTAMP NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS "{SCHEMA_DESTINO}".planner_tasks (
-        id_task                 VARCHAR(64) PRIMARY KEY,
-        titulo                  VARCHAR(500),
-        id_plan                 VARCHAR(64) REFERENCES "{SCHEMA_DESTINO}".planner_plans(id_plan) ON DELETE CASCADE,
-        id_bucket                VARCHAR(64) REFERENCES "{SCHEMA_DESTINO}".planner_buckets(id_bucket) ON DELETE SET NULL,
-        percentual_concluido    INT,
-        prioridade              INT,
-        dt_inicio               TIMESTAMP,
-        dt_vencimento           TIMESTAMP,
-        dt_conclusao            TIMESTAMP,
-        dt_criacao              TIMESTAMP,
-        fl_tem_descricao        BOOLEAN,
-        qtd_checklist_ativos    INT,
-        qtd_checklist_total     INT,
-        responsaveis            JSON,
-        categorias              JSON,
-        dt_atualizacao_etl      TIMESTAMP NOT NULL DEFAULT NOW()
-    );
-
-    CREATE INDEX IF NOT EXISTS ix_planner_tasks_id_plan   ON "{SCHEMA_DESTINO}".planner_tasks(id_plan);
-    CREATE INDEX IF NOT EXISTS ix_planner_tasks_id_bucket ON "{SCHEMA_DESTINO}".planner_tasks(id_bucket);
-
-    CREATE TABLE IF NOT EXISTS "{SCHEMA_DESTINO}".planner_tasks_responsaveis (
-        id_task  VARCHAR(64) REFERENCES "{SCHEMA_DESTINO}".planner_tasks(id_task) ON DELETE CASCADE,
-        id_user  VARCHAR(64) REFERENCES "{SCHEMA_DESTINO}".planner_users(id_user) ON DELETE CASCADE,
-        PRIMARY KEY (id_task, id_user)
-    );
-
-    CREATE TABLE IF NOT EXISTS "{SCHEMA_DESTINO}".planner_tasks_categorias (
-        id_task    VARCHAR(64) REFERENCES "{SCHEMA_DESTINO}".planner_tasks(id_task) ON DELETE CASCADE,
-        categoria  VARCHAR(255),
-        PRIMARY KEY (id_task, categoria)
-    );
-
-    CREATE INDEX IF NOT EXISTS ix_planner_tasks_responsaveis_id_user ON "{SCHEMA_DESTINO}".planner_tasks_responsaveis(id_user);
+    CREATE INDEX IF NOT EXISTS ix_microsoft_planners_id_plan   ON "{SCHEMA_DESTINO}".microsoft_planners(id_plan);
+    CREATE INDEX IF NOT EXISTS ix_microsoft_planners_id_bucket ON "{SCHEMA_DESTINO}".microsoft_planners(id_bucket);
     """
 
     with engine.begin() as conn:
         conn.execute(text(sql))
 
-    log_success("Tabelas garantidas com sucesso.")
+    log_success("Tabela garantida com sucesso.")
 
 
-def carregar_postgres(engine, df_plan, df_buckets, df_users, df_tasks, df_responsaveis, df_categorias):
-    log_info(
-        f"Carregando 1 plano, {len(df_buckets)} buckets, {len(df_users)} usuarios, "
-        f"{len(df_tasks)} tarefas, {len(df_responsaveis)} vinculos de responsavel e "
-        f"{len(df_categorias)} vinculos de categoria (TRUNCATE + INSERT numa unica transacao)."
-    )
+def carregar_postgres(engine, df_final):
+    log_info(f"Carregando {len(df_final)} tarefas (TRUNCATE + INSERT numa unica transacao).")
 
     with engine.begin() as conn:
-        conn.execute(text(
-            f'TRUNCATE TABLE "{SCHEMA_DESTINO}".planner_tasks_responsaveis, '
-            f'"{SCHEMA_DESTINO}".planner_tasks_categorias, '
-            f'"{SCHEMA_DESTINO}".planner_tasks, '
-            f'"{SCHEMA_DESTINO}".planner_buckets, '
-            f'"{SCHEMA_DESTINO}".planner_users, '
-            f'"{SCHEMA_DESTINO}".planner_plans RESTART IDENTITY CASCADE;'
-        ))
+        conn.execute(text(f'TRUNCATE TABLE "{SCHEMA_DESTINO}".microsoft_planners;'))
 
-        df_plan.to_sql(
-            name="planner_plans",
-            schema=SCHEMA_DESTINO,
-            con=conn,
-            if_exists="append",
-            index=False,
-            method=psql_insert_copy,
-        )
-
-        if not df_buckets.empty:
-            df_buckets.to_sql(
-                name="planner_buckets",
-                schema=SCHEMA_DESTINO,
-                con=conn,
-                if_exists="append",
-                index=False,
-                method=psql_insert_copy,
-            )
-
-        if not df_users.empty:
-            df_users.to_sql(
-                name="planner_users",
-                schema=SCHEMA_DESTINO,
-                con=conn,
-                if_exists="append",
-                index=False,
-                method=psql_insert_copy,
-            )
-
-        if not df_tasks.empty:
-            df_tasks.to_sql(
-                name="planner_tasks",
-                schema=SCHEMA_DESTINO,
-                con=conn,
-                if_exists="append",
-                index=False,
-                method=psql_insert_copy,
-            )
-
-        if not df_responsaveis.empty:
-            df_responsaveis.to_sql(
-                name="planner_tasks_responsaveis",
-                schema=SCHEMA_DESTINO,
-                con=conn,
-                if_exists="append",
-                index=False,
-                method=psql_insert_copy,
-            )
-
-        if not df_categorias.empty:
-            df_categorias.to_sql(
-                name="planner_tasks_categorias",
+        if not df_final.empty:
+            df_final.to_sql(
+                name="microsoft_planners",
                 schema=SCHEMA_DESTINO,
                 con=conn,
                 if_exists="append",
@@ -389,46 +240,50 @@ def executar():
     token = get_access_token(config)
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    log_info("Buscando dados do plano.")
-    plan_json = fetch_plan(config["plan_id"], headers)
-    df_plan = montar_df_plan(plan_json)
+    log_info(f"{len(config['plan_ids'])} planner(s) configurados: {', '.join(config['plan_ids'])}.")
 
-    log_info("Buscando rotulos (categorias) configurados no plano.")
-    category_descriptions = fetch_plan_details(config["plan_id"], headers)
-    log_info(f"{len(category_descriptions)} rotulos configurados.")
+    dados_por_plano = []
 
-    log_info("Buscando buckets do plano.")
-    buckets_json = fetch_buckets(config["plan_id"], headers)
-    df_buckets = montar_df_buckets(buckets_json)
-    log_info(f"{len(df_buckets)} buckets encontrados.")
+    for plan_id in config["plan_ids"]:
+        log_info(f"Buscando dados do planner {plan_id}.")
 
-    log_info("Buscando tarefas do plano.")
-    tasks_json = fetch_tasks(config["plan_id"], headers)
-    df_tasks = montar_df_tasks(tasks_json, category_descriptions)
-    log_info(f"{len(df_tasks)} tarefas encontradas.")
+        plan_json = fetch_plan(plan_id, headers)
+        buckets_json = fetch_buckets(plan_id, headers)
+        tasks_json = fetch_tasks(plan_id, headers)
+        category_descriptions = fetch_plan_details(plan_id, headers)
+
+        log_info(
+            f"Planner '{plan_json.get('title')}': {len(buckets_json)} buckets, "
+            f"{len(tasks_json)} tarefas, {len(category_descriptions)} rotulos."
+        )
+
+        dados_por_plano.append((plan_json, buckets_json, tasks_json, category_descriptions))
+
+    todas_tasks_json = [t for _, _, tasks_json, _ in dados_por_plano for t in tasks_json]
 
     log_info("Resolvendo nomes dos responsaveis pelas tarefas.")
-    ids_responsaveis = coletar_ids_responsaveis(tasks_json)
+    ids_responsaveis = coletar_ids_responsaveis(todas_tasks_json)
 
     try:
         users_json = fetch_users(ids_responsaveis, headers)
-        df_users = montar_df_users(users_json)
-        log_info(f"{len(df_users)} de {len(ids_responsaveis)} responsaveis resolvidos.")
+        nomes_por_id = {u["id"]: u.get("displayName") for u in users_json}
+        log_info(f"{len(nomes_por_id)} de {len(ids_responsaveis)} responsaveis resolvidos.")
     except requests.exceptions.HTTPError as e:
-        df_users = montar_df_users([])
-        log_error(
-            f"Falha ao resolver responsaveis (seguindo sem essa parte): {e}"
-        )
+        nomes_por_id = {}
+        log_error(f"Falha ao resolver responsaveis (mantendo os IDs brutos): {e}")
 
-    ids_resolvidos = set(df_users["id_user"]) if not df_users.empty else set()
-    df_tasks_responsaveis = montar_df_tasks_responsaveis(tasks_json, ids_resolvidos)
-    df_tasks_categorias = montar_df_tasks_categorias(tasks_json, category_descriptions)
-
-    garantir_tabelas(engine)
-    carregar_postgres(
-        engine, df_plan, df_buckets, df_users, df_tasks,
-        df_tasks_responsaveis, df_tasks_categorias,
+    df_final = pd.concat(
+        [
+            montar_df_planner(plan_json, buckets_json, tasks_json, category_descriptions, nomes_por_id)
+            for plan_json, buckets_json, tasks_json, category_descriptions in dados_por_plano
+        ],
+        ignore_index=True,
     )
+
+    log_info(f"{len(df_final)} tarefas consolidadas no total.")
+
+    garantir_tabela(engine)
+    carregar_postgres(engine, df_final)
 
     log_success("Job finalizado: planner_datalake.py.")
 
