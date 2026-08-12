@@ -13,6 +13,7 @@ def psql_insert_copy(table, conn, keys, data_iter):
             quoting=csv.QUOTE_MINIMAL,
             quotechar='"',
             escapechar='\\',
+            doublequote=False,
             lineterminator='\n'
         )
 
