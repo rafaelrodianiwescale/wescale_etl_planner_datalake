@@ -347,9 +347,16 @@ def executar():
 
     log_info("Resolvendo nomes dos responsaveis pelas tarefas.")
     ids_responsaveis = coletar_ids_responsaveis(tasks_json)
-    users_json = fetch_users(ids_responsaveis, headers)
-    df_users = montar_df_users(users_json)
-    log_info(f"{len(df_users)} de {len(ids_responsaveis)} responsaveis resolvidos.")
+
+    try:
+        users_json = fetch_users(ids_responsaveis, headers)
+        df_users = montar_df_users(users_json)
+        log_info(f"{len(df_users)} de {len(ids_responsaveis)} responsaveis resolvidos.")
+    except requests.exceptions.HTTPError as e:
+        df_users = montar_df_users([])
+        log_error(
+            f"Falha ao resolver responsaveis (seguindo sem essa parte): {e}"
+        )
 
     garantir_tabelas(engine)
     carregar_postgres(engine, df_plan, df_buckets, df_users, df_tasks)
