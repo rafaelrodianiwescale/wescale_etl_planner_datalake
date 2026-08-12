@@ -7,7 +7,7 @@ execuções).
 
 Roda no Airflow (servidor `10.10.0.14`), não mais via Agendador de Tarefas do Windows.
 
-## 📁 Estrutura
+## Estrutura
 
 ```
 etl_planner_datalake/
@@ -23,7 +23,7 @@ etl_planner_datalake/
 └── requirements.txt
 ```
 
-## 🔑 1. Criar o App Registration no Azure AD
+## 1. Criar o App Registration no Azure AD
 
 O script autentica na Microsoft Graph API via **OAuth 2.0 Client Credentials** (aplicativo, sem
 usuário logado), então é preciso um **App Registration** com permissão de aplicativo para o Planner:
@@ -40,13 +40,13 @@ usuário logado), então é preciso um **App Registration** com permissão de ap
 `AZURE_CLIENT_SECRET` ainda estão vazios** — o ETL não autentica até esses dois passos acima serem
 concluídos e os valores preenchidos no `.env` (local e no servidor).
 
-## 🗄️ 2. Tabelas no banco
+## 2. Tabelas no banco
 
 `planner_plans`, `planner_buckets` e `planner_tasks` são criadas automaticamente pelo próprio job
 (`garantir_tabelas()` em `jobs/planner_datalake.py`) na primeira execução — não precisa rodar DDL
 à parte.
 
-## ⚙️ 3. Estratégia de carga
+## 3. Estratégia de carga
 
 A cada execução, o job faz **TRUNCATE + INSERT** nas três tabelas, dentro de uma única transação:
 apaga o snapshot anterior e grava o estado atual do plano/buckets/tarefas. Isso reflete fielmente
@@ -54,11 +54,11 @@ o que existe no Planner a cada rodada, mas **não preserva histórico** de taref
 futuro for necessário manter histórico, trocar por upsert (`INSERT ... ON CONFLICT DO UPDATE`) em
 vez de truncar.
 
-## 🕑 4. Orquestração (Airflow)
+## 4. Orquestração (Airflow)
 
 DAG `wescale_planner_datalake_diario`, uma tarefa (`atualizar_dados`), 1x por dia.
 
-## 📝 Observações
+## Observações
 
 - `responsaveis` e `categorias` em `planner_tasks` são gravados como JSON (listas de IDs), pois o
   Graph API retorna esses campos como dicionários; para nomes legíveis de responsáveis seria
