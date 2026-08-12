@@ -17,6 +17,9 @@ from helpers.postgres_copy import psql_insert_copy
 
 SCHEMA_DESTINO = "public"
 
+# Graph API limita quantos valores cabem num filtro "id in (...)" por chamada
+TAMANHO_LOTE_USUARIOS = 15
+
 
 # ==========================================
 # EXTRAÇÃO (Microsoft Graph API - Planner)
@@ -62,6 +65,17 @@ def fetch_plan(plan_id, headers):
     return response.json()
 
 
+def fetch_plan_details(plan_id, headers) -> dict:
+    """Traz categoryDescriptions: mapeia os slots (category1..category25) pros
+    rotulos de texto configurados nesse plano especifico."""
+    url = f"https://graph.microsoft.com/v1.0/planner/plans/{plan_id}/details"
+
+    response = requests.get(url, headers=headers, timeout=60)
+    response.raise_for_status()
+
+    return response.json().get("categoryDescriptions", {}) or {}
+
+
 def fetch_buckets(plan_id, headers):
     url = f"https://graph.microsoft.com/v1.0/planner/plans/{plan_id}/buckets"
     return graph_get_all(url, headers)
@@ -70,6 +84,31 @@ def fetch_buckets(plan_id, headers):
 def fetch_tasks(plan_id, headers):
     url = f"https://graph.microsoft.com/v1.0/planner/plans/{plan_id}/tasks"
     return graph_get_all(url, headers)
+
+
+def fetch_users(user_ids, headers) -> list:
+    """Resolve id -> nome/email em lotes, via GET /users?$filter=id in (...).
+    Requer a permissao de aplicativo User.Read.All no App Registration."""
+    if not user_ids:
+        return []
+
+    usuarios = []
+    ids_unicos = sorted(set(user_ids))
+
+    for inicio in range(0, len(ids_unicos), TAMANHO_LOTE_USUARIOS):
+        lote = ids_unicos[inicio:inicio + TAMANHO_LOTE_USUARIOS]
+        filtro = " or ".join(f"id eq '{id_usuario}'" for id_usuario in lote)
+        url = (
+            "https://graph.microsoft.com/v1.0/users"
+            f"?$filter={filtro}&$select=id,displayName,mail"
+        )
+
+        response = requests.get(url, headers=headers, timeout=60)
+        response.raise_for_status()
+
+        usuarios.extend(response.json().get("value", []))
+
+    return usuarios
 
 
 # ==========================================
@@ -109,12 +148,30 @@ def montar_df_buckets(buckets_json) -> pd.DataFrame:
     return pd.DataFrame(registros)
 
 
-def montar_df_tasks(tasks_json) -> pd.DataFrame:
+def montar_df_users(users_json) -> pd.DataFrame:
+    registros = [
+        {
+            "id_user": u["id"],
+            "nome": u.get("displayName"),
+            "email": u.get("mail"),
+        }
+        for u in users_json
+    ]
+
+    return pd.DataFrame(registros)
+
+
+def montar_df_tasks(tasks_json, category_descriptions: dict) -> pd.DataFrame:
     registros = []
 
     for t in tasks_json:
         responsaveis = list((t.get("assignments") or {}).keys())
-        categorias = [k for k, v in (t.get("appliedCategories") or {}).items() if v]
+
+        slots_categoria = [k for k, v in (t.get("appliedCategories") or {}).items() if v]
+        rotulos_categoria = [
+            category_descriptions.get(slot, slot)
+            for slot in slots_categoria
+        ]
 
         registros.append({
             "id_task": t["id"],
@@ -131,18 +188,27 @@ def montar_df_tasks(tasks_json) -> pd.DataFrame:
             "qtd_checklist_ativos": t.get("activeCheckitemCount"),
             "qtd_checklist_total": t.get("totalCheckitemCount"),
             "responsaveis": json.dumps(responsaveis),
-            "categorias": json.dumps(categorias),
+            "categorias": json.dumps(rotulos_categoria),
         })
 
     return pd.DataFrame(registros)
 
 
+def coletar_ids_responsaveis(tasks_json) -> list:
+    ids = set()
+
+    for t in tasks_json:
+        ids.update((t.get("assignments") or {}).keys())
+
+    return sorted(ids)
+
+
 # ==========================================
-# CARGA (TRUNCATE + INSERT nas 3 tabelas, numa unica transacao)
+# CARGA (TRUNCATE + INSERT nas 4 tabelas, numa unica transacao)
 # ==========================================
 
 def garantir_tabelas(engine):
-    log_info("Garantindo tabelas planner_plans, planner_buckets e planner_tasks.")
+    log_info("Garantindo tabelas planner_plans, planner_buckets, planner_tasks e planner_users.")
 
     sql = f"""
     CREATE TABLE IF NOT EXISTS "{SCHEMA_DESTINO}".planner_plans (
@@ -156,6 +222,13 @@ def garantir_tabelas(engine):
         id_bucket           VARCHAR(64) PRIMARY KEY,
         id_plan             VARCHAR(64) REFERENCES "{SCHEMA_DESTINO}".planner_plans(id_plan) ON DELETE CASCADE,
         nome                VARCHAR(255),
+        dt_atualizacao_etl  TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS "{SCHEMA_DESTINO}".planner_users (
+        id_user             VARCHAR(64) PRIMARY KEY,
+        nome                VARCHAR(255),
+        email               VARCHAR(255),
         dt_atualizacao_etl  TIMESTAMP NOT NULL DEFAULT NOW()
     );
 
@@ -188,16 +261,17 @@ def garantir_tabelas(engine):
     log_success("Tabelas garantidas com sucesso.")
 
 
-def carregar_postgres(engine, df_plan, df_buckets, df_tasks):
+def carregar_postgres(engine, df_plan, df_buckets, df_users, df_tasks):
     log_info(
-        f"Carregando 1 plano, {len(df_buckets)} buckets e {len(df_tasks)} tarefas "
-        f"(TRUNCATE + INSERT numa unica transacao)."
+        f"Carregando 1 plano, {len(df_buckets)} buckets, {len(df_users)} usuarios "
+        f"e {len(df_tasks)} tarefas (TRUNCATE + INSERT numa unica transacao)."
     )
 
     with engine.begin() as conn:
         conn.execute(text(
             f'TRUNCATE TABLE "{SCHEMA_DESTINO}".planner_tasks, '
             f'"{SCHEMA_DESTINO}".planner_buckets, '
+            f'"{SCHEMA_DESTINO}".planner_users, '
             f'"{SCHEMA_DESTINO}".planner_plans RESTART IDENTITY CASCADE;'
         ))
 
@@ -213,6 +287,16 @@ def carregar_postgres(engine, df_plan, df_buckets, df_tasks):
         if not df_buckets.empty:
             df_buckets.to_sql(
                 name="planner_buckets",
+                schema=SCHEMA_DESTINO,
+                con=conn,
+                if_exists="append",
+                index=False,
+                method=psql_insert_copy,
+            )
+
+        if not df_users.empty:
+            df_users.to_sql(
+                name="planner_users",
                 schema=SCHEMA_DESTINO,
                 con=conn,
                 if_exists="append",
@@ -247,6 +331,10 @@ def executar():
     plan_json = fetch_plan(config["plan_id"], headers)
     df_plan = montar_df_plan(plan_json)
 
+    log_info("Buscando rotulos (categorias) configurados no plano.")
+    category_descriptions = fetch_plan_details(config["plan_id"], headers)
+    log_info(f"{len(category_descriptions)} rotulos configurados.")
+
     log_info("Buscando buckets do plano.")
     buckets_json = fetch_buckets(config["plan_id"], headers)
     df_buckets = montar_df_buckets(buckets_json)
@@ -254,11 +342,17 @@ def executar():
 
     log_info("Buscando tarefas do plano.")
     tasks_json = fetch_tasks(config["plan_id"], headers)
-    df_tasks = montar_df_tasks(tasks_json)
+    df_tasks = montar_df_tasks(tasks_json, category_descriptions)
     log_info(f"{len(df_tasks)} tarefas encontradas.")
 
+    log_info("Resolvendo nomes dos responsaveis pelas tarefas.")
+    ids_responsaveis = coletar_ids_responsaveis(tasks_json)
+    users_json = fetch_users(ids_responsaveis, headers)
+    df_users = montar_df_users(users_json)
+    log_info(f"{len(df_users)} de {len(ids_responsaveis)} responsaveis resolvidos.")
+
     garantir_tabelas(engine)
-    carregar_postgres(engine, df_plan, df_buckets, df_tasks)
+    carregar_postgres(engine, df_plan, df_buckets, df_users, df_tasks)
 
     log_success("Job finalizado: planner_datalake.py.")
 
